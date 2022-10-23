@@ -80,7 +80,7 @@ class GaussianVAE(nn.Module):
         kl_loss = -(
             0.5 * (1 + torch.log(q_z_given_x.variance) - q_z_given_x.mean**2 - q_z_given_x.variance).sum(-1)
         ).mean()
-        return F.mse_loss(fake_samples, real_samples) + kl_loss
+        return F.cross_entropy(fake_samples, real_samples) + kl_loss
 
     def forward(self, num_samples):
         z_samples = self.p_z.sample([num_samples]).to("cuda")
