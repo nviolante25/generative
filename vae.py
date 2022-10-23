@@ -6,7 +6,7 @@ from torch.optim import Adam
 import torch.nn.functional as F
 from torch.utils.data import DataLoader
 from torchvision.utils import make_grid
-from torch.distributions import Normal
+from torch.distributions import Normal, Independent
 
 from trainer import Trainer
 
@@ -43,7 +43,7 @@ class Decoder(nn.Module):
 
     def forward(self, z):
         x = self.net(z)
-        means, vars = F.softplus(x[:, : self.x_dim]), F.softplus(x[:, self.x_dim :])
+        means, vars = F.sigmoid(x[:, : self.x_dim]), F.softplus(x[:, self.x_dim :])
         return means, vars
 
 
@@ -55,38 +55,37 @@ class GaussianVAE(nn.Module):
         self.decoder = Decoder(x_dim, z_dim, hidden_dim).to(device)
         self.p_z = Normal(torch.zeros(z_dim).to(device), torch.ones(z_dim).to(device))
         self.z_dim = z_dim
-        self.optimizer = Adam(self.parameters(), lr=0.005)
+        self.optimizer = Adam(self.parameters(), lr=0.0005)
         self.device=device
 
     def train_step(self, real_samples):
         self.optimizer.zero_grad()
         # Encoder
         mean_enc, var_enc = self.encoder(real_samples)
-        q_z_given_x = Normal(mean_enc, var_enc)
+        q_z_given_x = Independent(Normal(mean_enc, var_enc), -1)
 
         # Decoder
         z_samples = q_z_given_x.rsample()
         mean_dec, var_dec = self.decoder(z_samples)
-        p_x_given_z = Normal(mean_dec, var_dec)
+        p_x_given_z = Independent(Normal(mean_dec, var_dec), -1)
 
         # Loss
-        fake_samples = p_x_given_z.rsample()
-        loss = self.aevb_loss(real_samples, fake_samples, q_z_given_x)
+        loss = self.aevb_loss(real_samples, q_z_given_x, p_x_given_z)
         loss.backward()
         self.optimizer.step()
         return loss.item()
 
-    def aevb_loss(self, real_samples, fake_samples, q_z_given_x):
+    def aevb_loss(self, real_samples, q_z_given_x, p_x_given_z):
         kl_loss = -(
             0.5 * (1 + torch.log(q_z_given_x.variance) - q_z_given_x.mean**2 - q_z_given_x.variance).sum(-1)
         ).mean()
-        return F.cross_entropy(fake_samples, real_samples) + kl_loss
+        reconstruction_loss = - p_x_given_z.log_prob(real_samples).mean()
+        return reconstruction_loss + kl_loss
 
     def forward(self, num_samples):
         z_samples = self.p_z.sample([num_samples]).to("cuda")
-        mean, var = self.decoder(z_samples)
-        p_x_given_z = Normal(mean, var)
-        return p_x_given_z.rsample()
+        mean, _ = self.decoder(z_samples)
+        return mean
 
     torch.no_grad()
     def sample_images(self, num_samples=16):
@@ -109,9 +108,9 @@ def sample_2d_manifold():
 if __name__ == "__main__":
     data = "./data/frey_rawface.mat"
     dest = "./training-runs"
-    run_name = "fray_faces"
+    run_name = "frey_faces"
     device = "cuda"
-    batch_size = 256
+    batch_size = 100
     dataset = torch.Tensor(loadmat(data)["ff"].T / 255.0).to(device)
     dataloader = DataLoader(dataset, batch_size=batch_size)
 
@@ -120,6 +119,7 @@ if __name__ == "__main__":
     hidden_dim = 200
     vae = GaussianVAE(x_dim, z_dim, hidden_dim, device)
 
-    total_epochs = 50
-    trainer = Trainer(vae, dataloader, total_epochs, dest, run_name)
+    total_steps = int(1e7)
+    log_every = int(5e5)
+    trainer = Trainer(vae, dataloader, total_steps, log_every, dest, run_name)
     trainer.fit()

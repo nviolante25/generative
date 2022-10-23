@@ -6,23 +6,32 @@ from pathlib import Path
 
 
 class Trainer:
-    def __init__(self, model, dataloader, total_epochs, dest, run_name):
+    def __init__(self, model, dataloader, total_steps, log_every, dest, run_name):
         self.model = model
         self.dataloader = dataloader
-        self.total_epochs = total_epochs
+        self.total_steps = total_steps
         self.outdir = self.create_output_folder(dest, self.model.name, run_name)
+        self.log_every = log_every
 
     def fit(self):
-        with tqdm(initial=0, total=self.total_epochs) as pbar:
-            for epoch in range(self.total_epochs):
+        self.step = 0 
+        self.tick = 0
+        self.model.train()
+        with tqdm(initial=0, total=self.total_steps) as pbar:
+            while self.step < self.total_steps:
                 for real_samples in self.dataloader:
+                    real_samples = real_samples.to(self.model.device)
                     loss = self.model.train_step(real_samples)
 
+                    pbar.update(real_samples.shape[0])
+                    self.step += real_samples.shape[0]
+
+                    if self.step // self.log_every > self.tick:
+                        self.tick +=1
+                        display_images = self.model.sample_images(64)
+                        display_images = Image.fromarray(display_images)
+                        display_images.save(os.path.join(self.outdir, f"fakes_{str(self.tick).zfill(6)}.png"))
                 pbar.set_description(f"Loss: {loss:.5f}")
-                pbar.update(1)
-                display_images = self.model.sample_images(64)
-                display_images = Image.fromarray(display_images)
-                display_images.save(os.path.join(self.outdir, f"fakes_{str(epoch).zfill(6)}.png"))
         self.save()
 
     def save(self):
