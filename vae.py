@@ -1,8 +1,6 @@
-import os
 import torch
 import numpy as np
 import torch.nn as nn
-from pathlib import Path
 from scipy.io import loadmat
 from torch.optim import Adam
 import torch.nn.functional as F
@@ -96,10 +94,9 @@ class GaussianVAE(nn.Module):
         z_samples = self.p_z.sample([num_samples]).to("cuda")
         mean, var = self.decoder(z_samples)
         p_x_given_z = Normal(mean, var)
-        return p_x_given_z.sample()
+        return p_x_given_z.rsample()
 
     torch.no_grad()
-
     def sample_images(self, num_samples=16):
         assert num_samples == int(np.sqrt(num_samples)) ** 2
         display_images = self(num_samples).view(num_samples, 1, 28, 20)
@@ -131,6 +128,6 @@ if __name__ == "__main__":
     hidden_dim = 200
     vae = GaussianVAE(x_dim, z_dim, hidden_dim, device)
 
-    total_epochs = 20
+    total_epochs = 50
     trainer = Trainer(vae, dataloader, total_epochs, dest, run_name)
     trainer.fit()
