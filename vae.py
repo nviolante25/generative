@@ -24,8 +24,8 @@ class Encoder(nn.Module):
         self.hidden_dim = hidden_dim
 
     def forward(self, x):
-        x = self.net(x)
-        means, vars = x[:, : self.z_dim], F.softplus(x[:, self.z_dim :])
+        z = self.net(x)
+        means, vars = z[:, : self.z_dim], F.softplus(z[:, self.z_dim :])
         return means, vars
 
 
@@ -42,8 +42,8 @@ class Decoder(nn.Module):
         self.hidden_dim = hidden_dim
 
     def forward(self, z):
-        z = self.net(z)
-        means, vars = F.relu(z[:, : self.x_dim]), F.softplus(z[:, self.x_dim :])
+        x = self.net(z)
+        means, vars = F.softplus(x[:, : self.x_dim]), F.softplus(x[:, self.x_dim :])
         return means, vars
 
 
@@ -56,6 +56,7 @@ class GaussianVAE(nn.Module):
         self.p_z = Normal(torch.zeros(z_dim).to(device), torch.ones(z_dim).to(device))
         self.z_dim = z_dim
         self.optimizer = Adam(self.parameters(), lr=0.005)
+        self.device=device
 
     def train_step(self, real_samples):
         self.optimizer.zero_grad()
@@ -76,19 +77,10 @@ class GaussianVAE(nn.Module):
         return loss.item()
 
     def aevb_loss(self, real_samples, fake_samples, q_z_given_x):
-        """
-        Auto-Encoding Variational Bayes Loss
-        MSE + KL
-        """
         kl_loss = -(
             0.5 * (1 + torch.log(q_z_given_x.variance) - q_z_given_x.mean**2 - q_z_given_x.variance).sum(-1)
         ).mean()
         return F.mse_loss(fake_samples, real_samples) + kl_loss
-
-    def sgvb_loss(self, real_samples, z_samples, p_x_given_z, q_z_given_x):
-        return -torch.mean(
-            p_x_given_z.log_prob(real_samples) + self.p_z.log_prob(z_samples) - q_z_given_x.log_prob(z_samples)
-        )
 
     def forward(self, num_samples):
         z_samples = self.p_z.sample([num_samples]).to("cuda")
