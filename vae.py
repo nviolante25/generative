@@ -55,7 +55,7 @@ class GaussianVAE(nn.Module):
         self.decoder = Decoder(x_dim, z_dim, hidden_dim).to(device)
         self.p_z = Normal(torch.zeros(z_dim).to(device), torch.ones(z_dim).to(device))
         self.z_dim = z_dim
-        self.optimizer = Adam(self.parameters(), lr=0.0005)
+        self.optimizer = Adam(self.parameters(), lr=0.001)
         self.device=device
 
     def train_step(self, real_samples):
@@ -83,7 +83,7 @@ class GaussianVAE(nn.Module):
         return reconstruction_loss + kl_loss
 
     def forward(self, num_samples):
-        z_samples = self.p_z.sample([num_samples]).to("cuda")
+        z_samples = self.p_z.rsample([num_samples]).to("cuda")
         mean, _ = self.decoder(z_samples)
         return mean
 
@@ -97,12 +97,6 @@ class GaussianVAE(nn.Module):
             (255 * torch.clip(display_images, 0, 1)).detach().cpu().numpy().transpose(1, 2, 0).astype(np.uint8)
         )
         return display_images
-
-
-def sample_2d_manifold():
-    z = torch.linspace(-3, 3, 16)
-    zz1, zz2 = torch.meshgrid(z, z, indexing="xy")
-    return torch.cat([zz1[None, ...], zz2[None, ...]]).view(-1, 2)
 
 
 if __name__ == "__main__":
