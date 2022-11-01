@@ -10,7 +10,7 @@ class Trainer:
         self.model = model
         self.dataloader = dataloader
         self.total_steps = total_steps
-        self.outdir = self.create_output_folder(dest, self.model.name, run_name)
+        self.outdir = self.create_output_folder(dest, run_name)
         self.log_every = log_every
 
     def fit(self):
@@ -41,10 +41,10 @@ class Trainer:
         torch.save(checkpoint, os.path.join(self.outdir, "model-checkpoint.pt"))
 
     @staticmethod
-    def create_output_folder(dest, model_name, run_name):
+    def create_output_folder(dest, run_name):
         os.makedirs(dest, exist_ok=True)
         dataset_name = Path(run_name).name
         num = len(os.listdir(dest))
-        outdir = os.path.join(dest, f"{str(num).zfill(4)}-{model_name}-{dataset_name}")
+        outdir = os.path.join(dest, f"{str(num).zfill(4)}-{dataset_name}")
         os.makedirs(outdir)
         return outdir

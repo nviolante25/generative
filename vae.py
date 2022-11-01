@@ -50,7 +50,6 @@ class Decoder(nn.Module):
 class GaussianVAE(nn.Module):
     def __init__(self, x_dim, z_dim, hidden_dim, device="cuda"):
         super().__init__()
-        self.name = "vae"
         self.encoder = Encoder(x_dim, z_dim, hidden_dim).to(device)
         self.decoder = Decoder(x_dim, z_dim, hidden_dim).to(device)
         self.p_z = Normal(torch.zeros(z_dim).to(device), torch.ones(z_dim).to(device))
@@ -70,17 +69,17 @@ class GaussianVAE(nn.Module):
         p_x_given_z = Independent(Normal(mean_dec, var_dec), -1)
 
         # Loss
-        loss = self.aevb_loss(real_samples, q_z_given_x, p_x_given_z)
+        loss = self.loss_fn(real_samples, q_z_given_x, p_x_given_z)
         loss.backward()
         self.optimizer.step()
         return loss.item()
 
-    def aevb_loss(self, real_samples, q_z_given_x, p_x_given_z):
+    def loss_fn(self, real_samples, q_z_given_x, p_x_given_z):
         kl_loss = -(
             0.5 * (1 + torch.log(q_z_given_x.variance) - q_z_given_x.mean**2 - q_z_given_x.variance).sum(-1)
         ).mean()
-        reconstruction_loss = - p_x_given_z.log_prob(real_samples).mean()
-        return reconstruction_loss + kl_loss
+        cross_entropy_loss = - p_x_given_z.log_prob(real_samples).mean()
+        return cross_entropy_loss + kl_loss
 
     def forward(self, num_samples):
         z_samples = self.p_z.rsample([num_samples]).to("cuda")
@@ -102,7 +101,7 @@ class GaussianVAE(nn.Module):
 if __name__ == "__main__":
     data = "./data/frey_rawface.mat"
     dest = "./training-runs"
-    run_name = "frey_faces"
+    run_name = "vae-frey_faces"
     device = "cuda"
     batch_size = 100
     dataset = torch.Tensor(loadmat(data)["ff"].T / 255.0).to(device)
