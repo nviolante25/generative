@@ -1,7 +1,7 @@
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from torchvision.datasets import MNIST, CIFAR10
+from torchvision.datasets import MNIST, CIFAR10, ImageNet
 from torchvision.transforms import Compose, ToTensor
 from torchvision.transforms.functional import to_pil_image
 from torch.utils.data import DataLoader
@@ -70,32 +70,39 @@ class VQVAEMnist(nn.Module):
         recontruction = self.decoder(latent_quantized)
         return codebook_loss, commitment_loss, recontruction
 
+class ResidualBlock(nn.Module):
+    def __init__(self, hidden_dim):
+        super().__init__()
+        self.block = nn.Sequential(
+            nn.Conv2d(in_channels=hidden_dim, out_channels=hidden_dim, kernel_size=3, padding=1),
+            nn.ReLU(),
+            nn.Conv2d(in_channels=hidden_dim, out_channels=hidden_dim, kernel_size=1),
+        ) 
 
+    def forward(self, x):
+        return F.relu(self.block(x) +  x)
+        
 class VQVAE(nn.Module):
     def __init__(self, codebook_dim, latent_dim) -> None:
         super().__init__()
         self.vq_layer = VectorQuantizer(codebook_dim, latent_dim)
         self.encoder = nn.Sequential(
-            nn.Conv2d(in_channels=3, out_channels=64, kernel_size=3, padding=1, stride=1),
-            nn.Conv2d(in_channels=64, out_channels=64, kernel_size=3, padding=1, stride=2),
+            nn.Conv2d(in_channels=3, out_channels=latent_dim, kernel_size=4, stride=2, padding=1),
             nn.ReLU(),
-            nn.Conv2d(in_channels=64, out_channels=128, kernel_size=3, padding=1, stride=1),
-            nn.Conv2d(in_channels=128, out_channels=128, kernel_size=3, padding=1, stride=2),
+            nn.Conv2d(in_channels=latent_dim, out_channels=latent_dim, kernel_size=4, stride=2, padding=1),
             nn.ReLU(),
-            nn.Conv2d(in_channels=128, out_channels=latent_dim, kernel_size=1),
-            nn.Conv2d(in_channels=latent_dim, out_channels=latent_dim, kernel_size=1),
+            ResidualBlock(latent_dim),
+            ResidualBlock(latent_dim),
         )
         self.decoder = nn.Sequential(
-            nn.Conv2d(in_channels=latent_dim, out_channels=128, kernel_size=1),
-            nn.Conv2d(in_channels=128, out_channels=128, kernel_size=1),
+            ResidualBlock(latent_dim),
+            ResidualBlock(latent_dim),
+            nn.Upsample(scale_factor=2.0, mode="bilinear"),
+            nn.Conv2d(in_channels=latent_dim, out_channels=latent_dim, kernel_size=3, stride=1, padding=1),
             nn.ReLU(),
-            nn.Upsample(scale_factor=2, mode='bilinear'),
-            nn.Conv2d(in_channels=128, out_channels=64, kernel_size=3, padding=1),
-            nn.Conv2d(in_channels=64, out_channels=64, kernel_size=3, padding=1),
+            nn.Upsample(scale_factor=2.0, mode="bilinear"),
+            nn.Conv2d(in_channels=latent_dim, out_channels=3, kernel_size=3, stride=1, padding=1),
             nn.ReLU(),
-            nn.Upsample(scale_factor=2, mode='bilinear'),
-            nn.Conv2d(in_channels=64, out_channels=64, kernel_size=3, padding=1),
-            nn.Conv2d(in_channels=64, out_channels=3, kernel_size=3, padding=1),
         )
 
     def train_step(self, x):
@@ -121,7 +128,7 @@ if __name__ == "__main__":
     vq_vae = VQVAE(512, 256).to(device)
     opt = Adam(vq_vae.parameters(), lr=2e-4)
 
-    total_images = int(250e3)
+    total_images = int(1000e3)
     cur_nimg = 0
     all_losses = []
     with tqdm(initial=0, total=total_images) as pbar:
@@ -138,3 +145,8 @@ if __name__ == "__main__":
             pbar.update(batch_size)
             pbar.set_description(f"Loss {loss.item():.4f}")
             all_losses.append(loss.item())
+
+    print()
+    grid = next(dataloader)[0][:64].to(device)
+    _, _, rec_grid = vq_vae.reconstruct(grid)
+    to_pil_image(rearrange(grid, '(b1 b2) c h w -> c (b1 h) (b2 w)', b1=8)).save("./grid.png")
