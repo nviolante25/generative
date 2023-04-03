@@ -2,8 +2,15 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import math
-from einops import rearrange, reduce, repeat
+from einops import rearrange, repeat
 from einops.layers.torch import Rearrange
+from torch.optim import Adam
+
+from torchvision.datasets import MNIST, CIFAR10
+from torchvision.transforms import Compose, ToTensor, Normalize, Lambda, Resize
+from torchvision.transforms.functional import to_pil_image
+from torch.utils.data import DataLoader
+from tqdm import tqdm
 
 
 def idx2res(idx):
@@ -148,18 +155,20 @@ class Generator(nn.Module):
             x = block(x)
         to_rgb = self.get_submodule(f"b{res}x{res}.to_rgb")
         rgb = to_rgb(x)
-
-        # Faded skip connection for progressive growing
-        if alpha < 1.0:
-            # Use to_rgb of lower resolution block
-            x_prev = F.interpolate(x_prev, scale_factor=2.0, mode="nearest")
-            to_rgb_prev = self.get_submodule(f"b{res//2}x{res//2}.to_rgb")
-            rgb = alpha * rgb + (1.0 - alpha) * to_rgb_prev(x_prev)
-
+        rgb = self.fade(rgb, x_prev, alpha)
         return rgb
 
     def sample_z(self, batch_size):
         return torch.randn((batch_size, self.z_dim), dtype=torch.float32)
+
+    def fade(self, rgb, x_prev, alpha):
+        previous_res = rgb.shape[-1] // 2
+        if alpha < 1.0:
+            # Use to_rgb of lower resolution block
+            to_rgb_prev = self.get_submodule(f"b{previous_res}x{previous_res}.to_rgb")
+            x_prev = F.interpolate(x_prev, scale_factor=2.0, mode="nearest")
+            return alpha * rgb + (1.0 - alpha) * to_rgb_prev(x_prev)
+        return rgb
 
 
 class DiscriminatorDownBlock(nn.Module):
@@ -229,11 +238,7 @@ class Discriminator(nn.Module):
         block = self.get_submodule(f"b{input_res}x{input_res}")
         x = block.from_rgb(rgb)
         x = block(x)
-        if alpha < 1.0 and input_res < self.img_resolution:
-            # Use from_rgb of lower resoltution block
-            block_prev = self.get_submodule(f"b{input_res // 2}x{input_res // 2}")
-            x_prev = block_prev.from_rgb(F.avg_pool2d(rgb, 2))
-            x = alpha * x + (1 - alpha) * x_prev
+        x = self.fade(rgb, x, alpha)
 
         for res in reversed([2 ** i for i in range(2, int(math.log2(input_res)))]):
             block = self.get_submodule(f"b{res}x{res}")
@@ -241,11 +246,79 @@ class Discriminator(nn.Module):
         
         return x
 
-res = 1024
-# gen = Generator(512, res)
-# gen(gen.sample_z(3), output_res=128)
-x = torch.randn((2, 3, 512, 512))
-disc = Discriminator(512, res)
-disc(x, alpha=0.5)
+    def fade(self, rgb, x, alpha):
+        input_res = rgb.shape[-1]
+        previous_res = input_res // 2
+        if alpha < 1.0 and input_res < self.img_resolution:
+            # Use from_rgb of previous block
+            from_rgb_prev = self.get_submodule(f"b{previous_res}x{previous_res}.from_rgb")
+            x_prev = from_rgb_prev(F.avg_pool2d(rgb, 2))
+            return alpha * x + (1 - alpha) * x_prev
+        return x
 
-print()
+
+class Trainer(nn.Module):
+    def __init__(self, z_dim, img_resolution) -> None:
+        super().__init__()
+        self.G = Generator(z_dim, img_resolution)
+        self.D = Discriminator(z_dim, img_resolution)
+
+        self.G_opt = Adam(self.G.parameters(), lr=0.001, betas=(0, 0.99), eps=1e-8)
+        self.D_opt = Adam(self.D.parameters(), lr=0.001, betas=(0, 0.99), eps=1e-8)
+
+
+    def train_step(self, real_images):
+        batch_size = real_images.shape[0]
+
+        # Discriminator step
+        z = self.G.sample_z(batch_size).to("cuda")
+        fake_images = self.G(z)
+        fake_logits = self.D(fake_images)
+        real_logits = self.D(real_images)
+        loss_D = discriminator_loss(real_logits, fake_logits)
+
+        self.D_opt.zero_grad()
+        loss_D.backward()
+        self.D_opt.step()
+
+        # Generator step
+        z = self.G.sample_z(batch_size).to("cuda")
+        fake_images = self.G(z)
+        fake_logits = self.D(fake_images)
+        loss_G = generator_loss(fake_logits)
+
+        self.G_opt.zero_grad()
+        loss_G.backward()
+        self.G_opt.step()
+
+    def fit(total_nimg=int(25e6)):
+        pass
+
+def cycle(dataloader):
+    while True:
+        for data in dataloader:
+            yield data
+
+def generator_loss(fake_logits):
+    return F.softplus(-fake_logits).mean()
+
+
+def discriminator_loss(real_logits, fake_logits):
+    return F.softplus(-real_logits).mean() + F.softplus(fake_logits).mean()
+
+
+if __name__ == "__main__":
+    dataset = MNIST("./data/mnist", transform=Compose([ToTensor(), Resize(32), Lambda(lambda x: 2.0 * x - 1.0)]), download=True)
+    trainer = Trainer(512, 32).to("cuda")
+
+    batch_size = 16
+    dataloader = cycle(DataLoader(dataset, batch_size=batch_size, drop_last=True))
+    total_images = int(100e6)
+    cur_nimg = 0
+    with tqdm(initial=0, total=total_images) as pbar:
+        while cur_nimg < total_images:
+            real_images = repeat(next(dataloader)[0].to("cuda"), "b 1 h w -> b c h w", c=3)
+            trainer.train_step(real_images)
+
+            cur_nimg += batch_size
+            pbar.update(batch_size)
