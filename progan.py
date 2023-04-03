@@ -6,13 +6,16 @@ from einops import rearrange, reduce
 from einops.layers.torch import Rearrange
 
 
+def pixel_norm(x, eps=10e-8):
+    return x / (torch.mean(x ** 2, dim=1, keepdim=True) + eps).sqrt()
+
 class PixelNorm2d(nn.Module):
     def __init__(self, eps=10e-8):
         super().__init__()
         self.eps = eps
 
     def forward(self, x):
-        return x / (torch.mean(x ** 2, dim=1, keepdim=True) + self.eps).sqrt()
+        return pixel_norm(x, self.eps)
     
 
 class EqualizedLinear(nn.Linear):
@@ -65,23 +68,35 @@ class EqualizedConv2d(nn.Conv2d):
         return self._conv_forward(input, self.weight * self.weight_scale, self.bias)
 
 
-class GeneratorBlock(nn.Module):
+class GeneratorInitBlock(nn.Module):
+    def __init__(self, z_dim):
+        super().__init__()
+        h = w = 4
+        self.fc0 = EqualizedLinear(z_dim, z_dim * h * w)
+        self.reshape = Rearrange("b (c h w) -> b c h w", c=z_dim, h=h, w=w)
+        self.conv0 = EqualizedConv2d(in_channels=z_dim, out_channels=z_dim, kernel_size=3, padding=1, padding_mode='reflect')
+        self.to_rgb = EqualizedConv2d(in_channels=z_dim, out_channels=3, kernel_size=1)
+
+
+    def forward(self, x):
+        x = pixel_norm(F.leaky_relu(self.reshape(self.fc0(x)), 0.2))
+        x = pixel_norm(F.leaky_relu(self.conv0(x), 0.2))
+        return x
+
+class GeneratorUpBlock(nn.Module):
     def __init__(self, channels_list):
         super().__init__()
         assert len(channels_list) == 3
         in_channels, hidden_channels, out_channels = channels_list
-        self.block = nn.Sequential(
-            nn.Upsample(scale_factor=2.0, mode="nearest"),
-            EqualizedConv2d(in_channels, hidden_channels, kernel_size=3, padding=1, padding_mode="reflect"),
-            nn.LeakyReLU(0.2),
-            PixelNorm2d(),
-            EqualizedConv2d(hidden_channels, out_channels, kernel_size=3, padding=1, padding_mode="reflect"),
-            nn.LeakyReLU(0.2),
-            PixelNorm2d(),
-        )
+        self.conv0 = EqualizedConv2d(in_channels, hidden_channels, kernel_size=3, padding=1, padding_mode="reflect")
+        self.conv1 = EqualizedConv2d(hidden_channels, out_channels, kernel_size=3, padding=1, padding_mode="reflect")
+        self.to_rgb = EqualizedConv2d(out_channels, out_channels=3, kernel_size=1)
 
     def forward(self, x):
-        return self.block(x)
+        x = F.interpolate(x, scale_factor=2.0, mode="nearest")
+        x = pixel_norm(F.leaky_relu(self.conv0(x), 0.2))
+        x = pixel_norm(F.leaky_relu(self.conv1(x), 0.2))
+        return x
 
 
 class Generator(nn.Module):
@@ -91,35 +106,26 @@ class Generator(nn.Module):
         self.z_dim = z_dim
         self.img_resolution = img_resolution
         
-        init_block = nn.Sequential(
-            EqualizedLinear(z_dim, z_dim * 16),
-            Rearrange("b (c h w) -> b c h w", c=z_dim, h=4, w=4),
-            nn.LeakyReLU(0.2),
-            PixelNorm2d(),
-            EqualizedConv2d(in_channels=z_dim, out_channels=z_dim, kernel_size=3, padding=1, padding_mode='reflect'),
-            nn.LeakyReLU(0.2),
-            PixelNorm2d(),
-        )
-        init_to_rgb = EqualizedConv2d(in_channels=z_dim, out_channels=3, kernel_size=1)
 
         channels_per_block = [
-            [512, 512, 512], # 8x8
-            [512, 512, 512], # 16x16
-            [512, 512, 512], # 32x32
-            [512, 256, 256], # 64x64
-            [256, 128, 128], # 128x128
-            [128, 64, 64],   # 256x256
-            [64, 32, 32],    # 512x512   
-            [32, 16, 16],    # 1024X1024
+            [z_dim, z_dim, z_dim],                      # 8x8
+            [z_dim, z_dim, z_dim],                      # 16x16
+            [z_dim, z_dim, z_dim],                      # 32x32
+            [z_dim, z_dim // 2, z_dim // 2],            # 64x64
+            [z_dim // 2, z_dim // 4, z_dim // 4],       # 128x128
+            [z_dim // 4, z_dim // 8, z_dim // 8],       # 256x256
+            [z_dim // 8, z_dim // 16, z_dim // 16],     # 512x512   
+            [z_dim // 16, z_dim // 32, z_dim // 32],    # 1024X1024
         ]
-        self.gen_blocks = nn.ModuleList()
-        self.gen_blocks.append(nn.ModuleDict({"up": init_block, "to_rgb": init_to_rgb}))
 
+        # Create named attributes: b4x4, b8x8,...,b1024x1024
+        self.add_module("b4x4", GeneratorInitBlock(z_dim))
         num_up_blocks = int(math.log2(img_resolution) - 2)
-        for i in range(num_up_blocks):
-            up = GeneratorBlock(channels_per_block[i])
-            to_rgb = EqualizedConv2d(in_channels=channels_per_block[i][-1], out_channels=3, kernel_size=1)
-            self.gen_blocks.append(nn.ModuleDict({"up": up, "to_rgb": to_rgb}))
+        for i in range(1, num_up_blocks + 1):
+            res = self.idx2resolution(i)
+            self.add_module(f"b{res}x{res}", GeneratorUpBlock(channels_per_block[i]))
+
+        self.num_blocks = num_up_blocks + 1
 
     def forward(self, z, alpha=1.0, last_block=None):
         """
@@ -132,27 +138,29 @@ class Generator(nn.Module):
         """
         assert z.shape[1] == self.z_dim
         if last_block is None:
-            last_block = len(self.gen_blocks) - 1
-        assert last_block <= len(self.gen_blocks) - 1
+            last_block = self.num_blocks - 1
+        assert last_block <= self.num_blocks - 1
 
         x = z
-        for block in self.gen_blocks[:last_block+1]:
+        for i in range(last_block + 1):
+            res = self.idx2resolution(i)
+            block = self.get_submodule(f"b{res}x{res}")
             x_prev = x
-            x = block["up"](x)
-
-        # Faded skip connection
-        to_rgb = self.gen_blocks[last_block]["to_rgb"]
+            x = block(x)
+        to_rgb = self.get_submodule(f"b{res}x{res}.to_rgb")
         rgb = to_rgb(x)
-        if last_block > 0:
+
+        # Faded skip connection during training
+        if last_block > 0 and alpha < 1.0:
             x_prev = F.interpolate(x_prev, scale_factor=2.0, mode="nearest")
-            to_rgb_prev = self.gen_blocks[last_block - 1]["to_rgb"]
+            to_rgb_prev = self.get_submodule(f"b{res//2}x{res//2}.to_rgb")
             rgb = alpha * rgb + (1.0 - alpha) * to_rgb_prev(x_prev)
 
-
-        if last_block == len(self.gen_blocks) - 1:
-            assert (x.shape[-2], x.shape[-1]) == (self.img_resolution, self.img_resolution)
-            assert (rgb.shape[-2], rgb.shape[-1]) == (self.img_resolution, self.img_resolution)
         return rgb
+
+    @staticmethod
+    def idx2resolution(idx):
+        return int(2 ** (idx + 2))
 
     def sample_z(self, batch_size):
         return torch.randn((batch_size, self.z_dim), dtype=torch.float32)
@@ -161,5 +169,5 @@ class Generator(nn.Module):
 
 gen = Generator(512, 256)
 z = gen.sample_z(2)
-x = gen(z, last_block=0)
+x = gen(z)
 print()
