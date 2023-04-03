@@ -128,7 +128,7 @@ class Generator(nn.Module):
             res = idx2res(i)
             self.add_module(f"b{res}x{res}", GeneratorUpBlock(*channels_per_block[i]))
 
-    def forward(self, z, alpha=1.0, last_block=None):
+    def forward(self, z, alpha=1.0, output_res=None):
         """
         Input:
             z: [batch_size, z_dim]
@@ -138,13 +138,11 @@ class Generator(nn.Module):
             x: [batch_size, 3, img_resolution, img_resolution]
         """
         assert z.shape[1] == self.z_dim
-        if last_block is None:
-            last_block = self.num_blocks - 1
-        assert last_block <= self.num_blocks - 1
+        if output_res is None:
+            output_res = self.img_resolution
 
         x = z
-        for i in range(last_block + 1):
-            res = idx2res(i)
+        for res in [2 ** i for i in range(2, 1 + int(math.log2(output_res)))]: # 4, 8, 16, etc
             block = self.get_submodule(f"b{res}x{res}")
             x_prev = x
             x = block(x)
@@ -152,12 +150,12 @@ class Generator(nn.Module):
         rgb = to_rgb(x)
 
         # Faded skip connection for progressive growing
-        if last_block > 0 and alpha < 1.0:
+        if alpha < 1.0:
+            # Use to_rgb of lower resolution block
             x_prev = F.interpolate(x_prev, scale_factor=2.0, mode="nearest")
             to_rgb_prev = self.get_submodule(f"b{res//2}x{res//2}.to_rgb")
             rgb = alpha * rgb + (1.0 - alpha) * to_rgb_prev(x_prev)
 
-        assert res == self.img_resolution
         return rgb
 
     def sample_z(self, batch_size):
@@ -225,24 +223,29 @@ class Discriminator(nn.Module):
             self.add_module(f"b{res}x{res}", DiscriminatorDownBlock(*channels_per_block[i]))
         self.add_module("b4x4", DiscriminatorLastBlock(*channels_per_block[0]))
 
-    def forward(self, rgb, alpha=1.0, first_block=None):
+    def forward(self, rgb, alpha=1.0):
 
-        if first_block is None:
-            first_block = self.total_num_blocks- 1 # higher-resolution
-
-        res = idx2res(first_block)
-        block = self.get_submodule(f"b{res}x{res}")
+        input_res = rgb.shape[-1]
+        block = self.get_submodule(f"b{input_res}x{input_res}")
         x = block.from_rgb(rgb)
-        for i in range(first_block, -1, -1):
-            res = idx2res(i)
+        x = block(x)
+        if alpha < 1.0 and input_res < self.img_resolution:
+            # Use from_rgb of lower resoltution block
+            block_prev = self.get_submodule(f"b{input_res // 2}x{input_res // 2}")
+            x_prev = block_prev.from_rgb(F.avg_pool2d(rgb, 2))
+            x = alpha * x + (1 - alpha) * x_prev
+
+        for res in reversed([2 ** i for i in range(2, int(math.log2(input_res)))]):
             block = self.get_submodule(f"b{res}x{res}")
             x = block(x)
         
         return x
 
-res = 4
-x = torch.randn((2, 3, res, res))
+res = 1024
+# gen = Generator(512, res)
+# gen(gen.sample_z(3), output_res=128)
+x = torch.randn((2, 3, 512, 512))
 disc = Discriminator(512, res)
-disc(x)
+disc(x, alpha=0.5)
 
 print()
