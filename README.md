@@ -9,3 +9,5 @@
     ![Original_VQVAE](./images/vq_vae.png)
     ![Rec_VQVAE](./images/vq_vae_rec.png)
 
+
+- [ProGAN](progan.py) from ["Progressive Growing of GANs for Improved Quality, Stability, and Variation"](https://arxiv.org/abs/1710.10196) Tero Karras, Timo Aila, Samuli Laine, Jaakko Lehtinen
