@@ -1,3 +1,4 @@
+import os
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -6,11 +7,17 @@ from einops import rearrange, repeat
 from einops.layers.torch import Rearrange
 from torch.optim import Adam
 
-from torchvision.datasets import MNIST, CIFAR10
+from torchvision.datasets import MNIST, CIFAR10, LSUN
 from torchvision.transforms import Compose, ToTensor, Normalize, Lambda, Resize
 from torchvision.transforms.functional import to_pil_image
-from torch.utils.data import DataLoader
+from torch.utils.data import DataLoader, Dataset
 from tqdm import tqdm
+
+from PIL import Image
+from pathlib import Path
+import cv2 as cv
+
+from torch.utils.tensorboard import SummaryWriter
 
 
 def idx2res(idx):
@@ -80,13 +87,13 @@ class EqualizedConv2d(nn.Conv2d):
 
 
 class GeneratorInitBlock(nn.Module):
-    def __init__(self, z_dim):
+    def __init__(self, z_dim, img_channels):
         super().__init__()
         h = w = 4
         self.fc0 = EqualizedLinear(z_dim, z_dim * h * w)
         self.reshape = Rearrange("b (c h w) -> b c h w", c=z_dim, h=h, w=w)
         self.conv0 = EqualizedConv2d(in_channels=z_dim, out_channels=z_dim, kernel_size=3, padding=1, padding_mode='reflect')
-        self.to_rgb = EqualizedConv2d(in_channels=z_dim, out_channels=3, kernel_size=1)
+        self.to_rgb = EqualizedConv2d(in_channels=z_dim, out_channels=img_channels, kernel_size=1)
 
     def forward(self, x):
         x = pixel_norm(F.leaky_relu(self.reshape(self.fc0(x)), 0.2))
@@ -95,11 +102,11 @@ class GeneratorInitBlock(nn.Module):
 
 
 class GeneratorUpBlock(nn.Module):
-    def __init__(self, in_channels, hidden_channels, out_channels):
+    def __init__(self, in_channels, hidden_channels, out_channels, img_channels):
         super().__init__()
         self.conv0 = EqualizedConv2d(in_channels, hidden_channels, kernel_size=3, padding=1, padding_mode="reflect")
         self.conv1 = EqualizedConv2d(hidden_channels, out_channels, kernel_size=3, padding=1, padding_mode="reflect")
-        self.to_rgb = EqualizedConv2d(out_channels, out_channels=3, kernel_size=1)
+        self.to_rgb = EqualizedConv2d(out_channels, out_channels=img_channels, kernel_size=1)
 
     def forward(self, x):
         x = F.interpolate(x, scale_factor=2.0, mode="nearest")
@@ -109,11 +116,12 @@ class GeneratorUpBlock(nn.Module):
 
 
 class Generator(nn.Module):
-    def __init__(self, z_dim, img_resolution):
+    def __init__(self, z_dim, img_resolution, img_channels):
         super().__init__()
         assert img_resolution % 2 == 0
         self.z_dim = z_dim
         self.img_resolution = img_resolution
+        self.img_channels = img_channels
         
 
         channels_per_block = [
@@ -129,11 +137,11 @@ class Generator(nn.Module):
         ]
 
         # Create named blocks: b4x4, b8x8,...,b1024x1024
-        self.add_module("b4x4", GeneratorInitBlock(z_dim))
+        self.add_module("b4x4", GeneratorInitBlock(z_dim, img_channels))
         self.num_blocks = int(math.log2(img_resolution) - 1)
         for i in range(1, self.num_blocks):
             res = idx2res(i)
-            self.add_module(f"b{res}x{res}", GeneratorUpBlock(*channels_per_block[i]))
+            self.add_module(f"b{res}x{res}", GeneratorUpBlock(*channels_per_block[i], img_channels))
 
     def forward(self, z, alpha=1.0, output_res=None):
         """
@@ -172,9 +180,9 @@ class Generator(nn.Module):
 
 
 class DiscriminatorDownBlock(nn.Module):
-    def __init__(self, in_channels, hidden_channels, out_channels):
+    def __init__(self, in_channels, hidden_channels, out_channels, img_channels):
         super().__init__()
-        self.from_rgb = EqualizedConv2d(3, in_channels, kernel_size=1)
+        self.from_rgb = EqualizedConv2d(img_channels, in_channels, kernel_size=1)
         self.conv0 = EqualizedConv2d(in_channels, hidden_channels, kernel_size=3, padding=1, padding_mode="reflect")
         self.conv1 = EqualizedConv2d(hidden_channels, out_channels, kernel_size=3, padding=1, padding_mode="reflect")
 
@@ -186,9 +194,9 @@ class DiscriminatorDownBlock(nn.Module):
 
 
 class DiscriminatorLastBlock(nn.Module):
-    def __init__(self, in_channels, hidden_channels, out_channels):
+    def __init__(self, in_channels, hidden_channels, out_channels, img_channels):
         super().__init__()
-        self.from_rgb = EqualizedConv2d(3, in_channels, kernel_size=1)
+        self.from_rgb = EqualizedConv2d(img_channels, in_channels, kernel_size=1)
         self.conv0 = EqualizedConv2d(in_channels + 1, hidden_channels, kernel_size=3, padding=1, padding_mode="reflect")
         self.conv1 = EqualizedConv2d(hidden_channels, out_channels, kernel_size=4)
         self.to_logits = EqualizedLinear(out_channels, 1)
@@ -209,10 +217,11 @@ class DiscriminatorLastBlock(nn.Module):
 
 
 class Discriminator(nn.Module):
-    def __init__(self, z_dim, img_resolution):
+    def __init__(self, z_dim, img_resolution, img_channels):
         super().__init__()
         self.z_dim = z_dim
         self.img_resolution = img_resolution
+        self.img_channels = img_channels
 
         channels_per_block = [
             [z_dim, z_dim, z_dim],                      # 4x4
@@ -229,8 +238,8 @@ class Discriminator(nn.Module):
         self.total_num_blocks = int(math.log2(img_resolution) - 1)
         for i in reversed(range(1, self.total_num_blocks)):
             res = idx2res(i)
-            self.add_module(f"b{res}x{res}", DiscriminatorDownBlock(*channels_per_block[i]))
-        self.add_module("b4x4", DiscriminatorLastBlock(*channels_per_block[0]))
+            self.add_module(f"b{res}x{res}", DiscriminatorDownBlock(*channels_per_block[i], img_channels))
+        self.add_module("b4x4", DiscriminatorLastBlock(*channels_per_block[0], img_channels))
 
     def forward(self, rgb, alpha=1.0):
 
@@ -257,47 +266,135 @@ class Discriminator(nn.Module):
         return x
 
 
-class Trainer(nn.Module):
-    def __init__(self, z_dim, img_resolution) -> None:
+class Trainer():
+    def __init__(self, outdir, dataset, z_dim, img_resolution, img_channels, batch_size, r1_gamma, drift_weight=0.001) -> None:
         super().__init__()
-        self.G = Generator(z_dim, img_resolution)
-        self.D = Discriminator(z_dim, img_resolution)
+        self.G = Generator(z_dim, img_resolution, img_channels).to("cuda")
+        self.D = Discriminator(z_dim, img_resolution, img_channels).to("cuda")
 
-        self.G_opt = Adam(self.G.parameters(), lr=0.001, betas=(0, 0.99), eps=1e-8)
-        self.D_opt = Adam(self.D.parameters(), lr=0.001, betas=(0, 0.99), eps=1e-8)
+        self.G_opt = Adam(self.G.parameters(), lr=0.002, betas=(0, 0.99), eps=1e-8)
+        self.D_opt = Adam(self.D.parameters(), lr=0.002, betas=(0, 0.99), eps=1e-8)
+
+        self.z_dim = z_dim
+        self.img_resolution = img_resolution
+        self.batch_size = batch_size
+
+        self.dataloader = cycle(DataLoader(dataset, batch_size=batch_size, drop_last=True, num_workers=16))
+
+        self.logger = SummaryWriter(outdir)
+        self.outdir = outdir
+        self.drift_weight = drift_weight
+        self.r1_gamma = r1_gamma
+        self.save_loss_every_kimg = 1
+        self.save_grid_every_kimg = 5
+        self.grid_size = 8
+        self.grid_z = self.G.sample_z(self.grid_size * self.grid_size).to("cuda")
 
 
-    def train_step(self, real_images):
+    def train_step(self, real_images, alpha, output_res):
         batch_size = real_images.shape[0]
+
+        if output_res != real_images.shape[-1]:
+            real_images = F.interpolate(real_images, size=output_res)
 
         # Discriminator step
         z = self.G.sample_z(batch_size).to("cuda")
-        fake_images = self.G(z)
-        fake_logits = self.D(fake_images)
-        real_logits = self.D(real_images)
+        fake_images = self.G(z, alpha, output_res)
+
+        assert fake_images.shape == real_images.shape
+        fake_logits = self.D(fake_images, alpha)
+        real_images.requires_grad_(True)
+        real_logits = self.D(real_images, alpha)
         loss_D = discriminator_loss(real_logits, fake_logits)
+        loss_D_drift = self.drift_weight * drift_loss(real_logits)
+        loss_D_r1 = 0.5 * self.r1_gamma * r1_regularization(real_logits, real_images)
 
         self.D_opt.zero_grad()
-        loss_D.backward()
+        (loss_D + loss_D_drift + loss_D_r1).backward()
         self.D_opt.step()
 
         # Generator step
         z = self.G.sample_z(batch_size).to("cuda")
-        fake_images = self.G(z)
-        fake_logits = self.D(fake_images)
+        fake_images = self.G(z, alpha, output_res)
+        fake_logits = self.D(fake_images, alpha)
         loss_G = generator_loss(fake_logits)
 
         self.G_opt.zero_grad()
         loss_G.backward()
         self.G_opt.step()
 
-    def fit(total_nimg=int(25e6)):
-        pass
+        losses = {
+            "G": loss_G.item(),
+            "D": loss_D.item(),
+            "D_drift": loss_D_drift.item(),
+            "D_r1":loss_D_r1.item(),
+        }
+        return losses
+
+    def fit(self, kimg_per_phase=800):
+        max_res_log = int(math.log2(self.img_resolution))
+        phase_resolutions = [2 ** i for i in range(2, max_res_log + 1) for _ in range(2)][1:]
+
+        cur_nimg = 0
+        cur_phase_tick = 0
+        cur_phase = "stable"
+        next_phase = "fade"
+        phase_bar = tqdm(initial=0, total=int(kimg_per_phase * 1e3), position=1)
+        cur_res = phase_resolutions[cur_phase_tick]
+        phase_bar.set_description(f"phase: {cur_phase} at {cur_res}x{cur_res}")
+
+        total_images = int(kimg_per_phase* (2 * self.G.num_blocks - 1) * 1e3)
+        with tqdm(initial=0, total=total_images, position=0, desc="trainig") as pbar:
+            while cur_nimg < total_images:
+                cur_res = phase_resolutions[cur_phase_tick]
+                if cur_phase == "stable":
+                    alpha = 1.0
+                elif cur_phase == "fade":
+                    alpha = (cur_nimg - (cur_phase_tick * kimg_per_phase * 1.0e3)) / (kimg_per_phase * 1.0e3)
+
+                # self.logger.add_scalar("Progressive Growing/alpha", alpha, cur_nimg)
+                    
+                real_images = next(self.dataloader).to("cuda")
+                losses = trainer.train_step(real_images, alpha, cur_res)
+
+                self.report(losses, cur_res, cur_nimg)
+                self.save_snapshot(cur_nimg, cur_res)
+
+                if cur_nimg // (kimg_per_phase * 1e3) != cur_phase_tick:
+                    cur_phase_tick += 1
+                    assert cur_phase_tick == int(cur_nimg // (kimg_per_phase * 1e3))
+                    cur_phase, next_phase = next_phase, cur_phase
+                    phase_bar.reset()
+                    if cur_phase == "stable":
+                        phase_bar.set_description(f"phase: {cur_phase} at {cur_res}x{cur_res}")
+                    elif cur_phase == "fade":
+                        phase_bar.set_description(f"phase: {cur_phase} from {cur_res}x{cur_res} to {2*cur_res}x{2*cur_res}")
+
+                cur_nimg += self.batch_size
+                pbar.update(self.batch_size)
+                phase_bar.update(self.batch_size)
+
+        torch.save({"G": self.G.state_dict()}, os.path.join(self.outdir, f"progan_cats_{cur_res}x{cur_res}_final.pt"))
+
+    def report(self, losses, cur_res, cur_nimg):
+        if (cur_nimg % (self.save_loss_every_kimg * 1e3) < self.batch_size) == 0:
+            for name, value in losses.items():
+                self.logger.add_scalar(f"Loss/{name}", value, cur_nimg)
+            self.logger.add_scalar("Progressive Growing/resolution", cur_res, cur_nimg)
+
+    @torch.no_grad()
+    def save_snapshot(self, cur_nimg, cur_res):
+        if (cur_nimg % (self.save_grid_every_kimg * 1e3) < self.batch_size):
+            grid_img = rearrange(self.G(self.grid_z), "(b1 b2) c h w -> c (b1 h) (b2 w)", b1=self.grid_size, b2=self.grid_size)
+            filename = os.path.join(self.outdir, f"fakes_{str(cur_nimg // 1000).zfill(5)}kimg.png")
+            to_pil_image(grid_img.clip(-1, 1) * 0.5 + 0.5).save(filename)
+            torch.save({"G": self.G.state_dict()}, os.path.join(self.outdir, f"network-{str(cur_nimg // 1000).zfill(5)}kimg.pt"))
 
 def cycle(dataloader):
     while True:
         for data in dataloader:
             yield data
+
 
 def generator_loss(fake_logits):
     return F.softplus(-fake_logits).mean()
@@ -307,18 +404,79 @@ def discriminator_loss(real_logits, fake_logits):
     return F.softplus(-real_logits).mean() + F.softplus(fake_logits).mean()
 
 
+def r1_regularization(real_logits, real_images):
+    grad_D = torch.autograd.grad(outputs=real_logits.sum(), inputs=real_images, create_graph=True)[0]
+    grad_D = rearrange(grad_D, "b c h w -> b (c h w)")
+    return torch.norm(grad_D, p=2, dim=1).mean()
+
+
+def drift_loss(real_logits):
+    return (real_logits ** 2).mean()
+
+
+
+class ImageDataset(Dataset):
+    def __init__(self, source_dir):
+      super().__init__()
+      Image.init()
+      self._transform = Compose([ToTensor(), Resize(64), Lambda(lambda x: 2.0 * x - 1.0)])
+      self._image_paths = self._get_image_paths(source_dir)
+      self._image_shape = list(self[0].shape)
+
+    def _get_image_paths(self, source_dir):
+        paths = [str(f) for f in Path(source_dir).rglob('*') if self.is_image_ext(f) and os.path.isfile(f)] 
+        if not len(paths) > 0:
+            raise ValueError(f"No images found in {source_dir}")
+        return paths
+
+    def __len__(self):
+        return len(self._image_paths)
+
+    def __getitem__(self, idx):
+        image = Image.open(self._image_paths[idx])
+        image_tensor = self._transform(image)
+        return image_tensor
+
+    @staticmethod
+    def is_image_ext(filename: str):
+        ext = str(filename).split('.')[-1].lower()
+        return f'.{ext}' in Image.EXTENSION 
+
+
 if __name__ == "__main__":
-    dataset = MNIST("./data/mnist", transform=Compose([ToTensor(), Resize(32), Lambda(lambda x: 2.0 * x - 1.0)]), download=True)
-    trainer = Trainer(512, 32).to("cuda")
+    dataset = ImageDataset("/data/nviolant/data_eg3d/afhq_cats_mirrored")
+    # dataset = MNIST("./data/mnist", transform=Compose([ToTensor(), Resize(32), Lambda(lambda x: 2.0 * x - 1.0)]))
+    
+    trainer = Trainer(
+        "./training-runs/progan-cats-64x64",
+        dataset,
+        z_dim=512, 
+        img_resolution=64,
+        img_channels=3,
+        batch_size=64,
+        r1_gamma=0.01,
+        drift_weight=0.001,
+    )
 
-    batch_size = 16
-    dataloader = cycle(DataLoader(dataset, batch_size=batch_size, drop_last=True))
-    total_images = int(100e6)
-    cur_nimg = 0
-    with tqdm(initial=0, total=total_images) as pbar:
-        while cur_nimg < total_images:
-            real_images = repeat(next(dataloader)[0].to("cuda"), "b 1 h w -> b c h w", c=3)
-            trainer.train_step(real_images)
+    trainer.fit(kimg_per_phase=2)
 
-            cur_nimg += batch_size
-            pbar.update(batch_size)
+
+    # # Show some images
+    # G = Generator(512, 32, 3)
+    # G.load_state_dict(torch.load("training-runs/progan-cats-32x32/progan_cats_32x32.pt")["G"])
+    # G.to("cuda")
+
+    # grid_z = G.sample_z(256).to("cuda")
+    # grid_img = G(grid_z)
+    # grid_img = to_pil_image((rearrange(grid_img, "(b1 b2) c h w -> c (b1 h) (b2 w)", b1=16, b2=16)* 0.5 + 0.5).clip(0, 1))
+
+
+    # def wgan_generator_loss(fake_logits):
+    #     return -fake_logits.mean()
+
+    # def wgan_discriminator_loss(real_logits, fake_logits):
+    #     return fake_logits.mean() - real_logits.mean()
+
+    # # ProGAN Mnist was trained
+    # lr=0.002 with non-saturating loss
+    # 
