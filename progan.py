@@ -285,8 +285,8 @@ class Trainer():
         self.outdir = outdir
         self.drift_weight = drift_weight
         self.r1_gamma = r1_gamma
-        self.save_loss_every_kimg = 1
-        self.save_grid_every_kimg = 5
+        self.save_loss_every_kimg = 10
+        self.save_grid_every_kimg = 200
         self.grid_size = 8
         self.grid_z = self.G.sample_z(self.grid_size * self.grid_size).to("cuda")
 
@@ -351,14 +351,12 @@ class Trainer():
                     alpha = 1.0
                 elif cur_phase == "fade":
                     alpha = (cur_nimg - (cur_phase_tick * kimg_per_phase * 1.0e3)) / (kimg_per_phase * 1.0e3)
-
-                # self.logger.add_scalar("Progressive Growing/alpha", alpha, cur_nimg)
                     
                 real_images = next(self.dataloader).to("cuda")
                 losses = trainer.train_step(real_images, alpha, cur_res)
 
                 self.report(losses, cur_res, cur_nimg)
-                self.save_snapshot(cur_nimg, cur_res)
+                self.save_snapshot(cur_nimg, alpha, cur_res)
 
                 if cur_nimg // (kimg_per_phase * 1e3) != cur_phase_tick:
                     cur_phase_tick += 1
@@ -377,18 +375,18 @@ class Trainer():
         torch.save({"G": self.G.state_dict()}, os.path.join(self.outdir, f"progan_cats_{cur_res}x{cur_res}_final.pt"))
 
     def report(self, losses, cur_res, cur_nimg):
-        if (cur_nimg % (self.save_loss_every_kimg * 1e3) < self.batch_size) == 0:
+        if (cur_nimg % (self.save_loss_every_kimg * 1e3)) < self.batch_size:
             for name, value in losses.items():
                 self.logger.add_scalar(f"Loss/{name}", value, cur_nimg)
             self.logger.add_scalar("Progressive Growing/resolution", cur_res, cur_nimg)
 
     @torch.no_grad()
-    def save_snapshot(self, cur_nimg, cur_res):
-        if (cur_nimg % (self.save_grid_every_kimg * 1e3) < self.batch_size):
-            grid_img = rearrange(self.G(self.grid_z), "(b1 b2) c h w -> c (b1 h) (b2 w)", b1=self.grid_size, b2=self.grid_size)
-            filename = os.path.join(self.outdir, f"fakes_{str(cur_nimg // 1000).zfill(5)}kimg.png")
+    def save_snapshot(self, cur_nimg, alpha, cur_res):
+        if (cur_nimg % (self.save_grid_every_kimg * 1e3)) < self.batch_size:
+            grid_img = rearrange(self.G(self.grid_z, alpha, cur_res), "(b1 b2) c h w -> c (b1 h) (b2 w)", b1=self.grid_size, b2=self.grid_size)
+            filename = os.path.join(self.outdir, f"fakes_{str(cur_nimg // 1000).zfill(8)}kimg.png")
             to_pil_image(grid_img.clip(-1, 1) * 0.5 + 0.5).save(filename)
-            torch.save({"G": self.G.state_dict()}, os.path.join(self.outdir, f"network-{str(cur_nimg // 1000).zfill(5)}kimg.pt"))
+            torch.save({"G": self.G.state_dict()}, os.path.join(self.outdir, f"network-{str(cur_nimg // 1000).zfill(8)}kimg.pt"))
 
 def cycle(dataloader):
     while True:
@@ -445,8 +443,6 @@ class ImageDataset(Dataset):
 
 if __name__ == "__main__":
     dataset = ImageDataset("/data/nviolant/data_eg3d/afhq_cats_mirrored")
-    # dataset = MNIST("./data/mnist", transform=Compose([ToTensor(), Resize(32), Lambda(lambda x: 2.0 * x - 1.0)]))
-    
     trainer = Trainer(
         "./training-runs/progan-cats-64x64",
         dataset,
@@ -457,8 +453,7 @@ if __name__ == "__main__":
         r1_gamma=0.01,
         drift_weight=0.001,
     )
-
-    trainer.fit(kimg_per_phase=2)
+    trainer.fit(kimg_per_phase=250)
 
 
     # # Show some images
