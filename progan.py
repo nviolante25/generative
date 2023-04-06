@@ -16,6 +16,7 @@ from tqdm import tqdm
 from PIL import Image
 from pathlib import Path
 import cv2 as cv
+from copy import deepcopy
 
 from torch.utils.tensorboard import SummaryWriter
 
@@ -267,7 +268,20 @@ class Discriminator(nn.Module):
 
 
 class Trainer():
-    def __init__(self, outdir, dataset, z_dim, img_resolution, img_channels, batch_size, r1_gamma, drift_weight=0.001) -> None:
+    def __init__(
+        self, 
+        outdir, 
+        dataset, 
+        z_dim, 
+        img_resolution, 
+        img_channels, 
+        batch_size, 
+        r1_gamma,
+        save_loss_every_kimg = 1,
+        save_grid_every_kimg = 400,
+        kimg_per_phase = 800,
+        drift_weight=0.001,
+    ):
         super().__init__()
         self.G = Generator(z_dim, img_resolution, img_channels).to("cuda")
         self.D = Discriminator(z_dim, img_resolution, img_channels).to("cuda")
@@ -285,8 +299,9 @@ class Trainer():
         self.outdir = outdir
         self.drift_weight = drift_weight
         self.r1_gamma = r1_gamma
-        self.save_loss_every_kimg = 10
-        self.save_grid_every_kimg = 200
+        self.save_loss_every_kimg = save_loss_every_kimg
+        self.save_grid_every_kimg = save_grid_every_kimg
+        self.kimg_per_phase = kimg_per_phase
         self.grid_size = 8
         self.grid_z = self.G.sample_z(self.grid_size * self.grid_size).to("cuda")
 
@@ -307,7 +322,7 @@ class Trainer():
         real_logits = self.D(real_images, alpha)
         loss_D = discriminator_loss(real_logits, fake_logits)
         loss_D_drift = self.drift_weight * drift_loss(real_logits)
-        loss_D_r1 = 0.5 * self.r1_gamma * r1_regularization(real_logits, real_images)
+        loss_D_r1 = 0.5 * self.r1_gamma * r1_penalty_loss(real_logits, real_images)
 
         self.D_opt.zero_grad()
         (loss_D + loss_D_drift + loss_D_r1).backward()
@@ -331,7 +346,7 @@ class Trainer():
         }
         return losses
 
-    def fit(self, kimg_per_phase=800):
+    def fit(self):
         max_res_log = int(math.log2(self.img_resolution))
         phase_resolutions = [2 ** i for i in range(2, max_res_log + 1) for _ in range(2)][1:]
 
@@ -339,18 +354,18 @@ class Trainer():
         cur_phase_tick = 0
         cur_phase = "stable"
         next_phase = "fade"
-        phase_bar = tqdm(initial=0, total=int(kimg_per_phase * 1e3), position=1)
+        phase_bar = tqdm(initial=0, total=int(self.kimg_per_phase * 1e3), position=1)
         cur_res = phase_resolutions[cur_phase_tick]
         phase_bar.set_description(f"phase: {cur_phase} at {cur_res}x{cur_res}")
 
-        total_images = int(kimg_per_phase* (2 * self.G.num_blocks - 1) * 1e3)
+        total_images = int(self.kimg_per_phase* (2 * self.G.num_blocks - 1) * 1e3)
         with tqdm(initial=0, total=total_images, position=0, desc="trainig") as pbar:
             while cur_nimg < total_images:
                 cur_res = phase_resolutions[cur_phase_tick]
                 if cur_phase == "stable":
                     alpha = 1.0
                 elif cur_phase == "fade":
-                    alpha = (cur_nimg - (cur_phase_tick * kimg_per_phase * 1.0e3)) / (kimg_per_phase * 1.0e3)
+                    alpha = (cur_nimg - (cur_phase_tick * self.kimg_per_phase * 1.0e3)) / (self.kimg_per_phase * 1.0e3)
                     
                 real_images = next(self.dataloader).to("cuda")
                 losses = trainer.train_step(real_images, alpha, cur_res)
@@ -358,9 +373,9 @@ class Trainer():
                 self.report(losses, cur_res, cur_nimg)
                 self.save_snapshot(cur_nimg, alpha, cur_res)
 
-                if cur_nimg // (kimg_per_phase * 1e3) != cur_phase_tick:
+                if cur_nimg // (self.kimg_per_phase * 1e3) != cur_phase_tick:
                     cur_phase_tick += 1
-                    assert cur_phase_tick == int(cur_nimg // (kimg_per_phase * 1e3))
+                    assert cur_phase_tick == int(cur_nimg // (self.kimg_per_phase * 1e3))
                     cur_phase, next_phase = next_phase, cur_phase
                     phase_bar.reset()
                     if cur_phase == "stable":
@@ -383,10 +398,17 @@ class Trainer():
     @torch.no_grad()
     def save_snapshot(self, cur_nimg, alpha, cur_res):
         if (cur_nimg % (self.save_grid_every_kimg * 1e3)) < self.batch_size:
-            grid_img = rearrange(self.G(self.grid_z, alpha, cur_res), "(b1 b2) c h w -> c (b1 h) (b2 w)", b1=self.grid_size, b2=self.grid_size)
+            grid_z = rearrange(self.grid_z, "(b1 b2) z -> b1 b2 z", b2=1)
+            grid_img = torch.cat([self.G(z, alpha, cur_res) for z in grid_z])
+            grid_img = rearrange(grid_img, "(b1 b2) c h w -> c (b1 h) (b2 w)", b1=self.grid_size, b2=self.grid_size)
             filename = os.path.join(self.outdir, f"fakes_{str(cur_nimg // 1000).zfill(8)}kimg.png")
             to_pil_image(grid_img.clip(-1, 1) * 0.5 + 0.5).save(filename)
             torch.save({"G": self.G.state_dict()}, os.path.join(self.outdir, f"network-{str(cur_nimg // 1000).zfill(8)}kimg.pt"))
+
+def update_ema(G_ema, G, weight=0.999):
+    for (name_ema, param_ema), (name, param) in zip(G_ema.named_parameters(), G.named_parameters()):
+        assert name_ema == name
+        param_ema.copy_(weight * param + (1 - weight) * param_ema)
 
 def cycle(dataloader):
     while True:
@@ -397,27 +419,23 @@ def cycle(dataloader):
 def generator_loss(fake_logits):
     return F.softplus(-fake_logits).mean()
 
-
 def discriminator_loss(real_logits, fake_logits):
     return F.softplus(-real_logits).mean() + F.softplus(fake_logits).mean()
 
-
-def r1_regularization(real_logits, real_images):
-    grad_D = torch.autograd.grad(outputs=real_logits.sum(), inputs=real_images, create_graph=True)[0]
-    grad_D = rearrange(grad_D, "b c h w -> b (c h w)")
-    return torch.norm(grad_D, p=2, dim=1).mean()
-
+def r1_penalty_loss(real_logits, real_images):
+    grad_D_wrt_reals = torch.autograd.grad(outputs=real_logits.sum(), inputs=real_images, create_graph=True)[0]
+    grad_D_wrt_reals = rearrange(grad_D_wrt_reals, "b c h w -> b (c h w)")
+    return torch.norm(grad_D_wrt_reals, p=2, dim=1).mean()
 
 def drift_loss(real_logits):
     return (real_logits ** 2).mean()
-
 
 
 class ImageDataset(Dataset):
     def __init__(self, source_dir):
       super().__init__()
       Image.init()
-      self._transform = Compose([ToTensor(), Resize(64), Lambda(lambda x: 2.0 * x - 1.0)])
+      self._transform = Compose([ToTensor(), Lambda(lambda x: 2.0 * x - 1.0)])
       self._image_paths = self._get_image_paths(source_dir)
       self._image_shape = list(self[0].shape)
 
@@ -442,18 +460,21 @@ class ImageDataset(Dataset):
 
 
 if __name__ == "__main__":
-    dataset = ImageDataset("/data/nviolant/data_eg3d/afhq_cats_mirrored")
+    dataset = ImageDataset("/data/nviolant/data_eg3d/afhq-mirror-256x256")
     trainer = Trainer(
-        "./training-runs/progan-cats-64x64",
+        "./training-runs/progan-cats-256x256",
         dataset,
         z_dim=512, 
-        img_resolution=64,
+        img_resolution=256,
         img_channels=3,
-        batch_size=64,
+        batch_size=16,
         r1_gamma=0.01,
         drift_weight=0.001,
+        save_loss_every_kimg=5,
+        save_grid_every_kimg=400,
+        kimg_per_phase=800,
     )
-    trainer.fit(kimg_per_phase=250)
+    trainer.fit()
 
 
     # # Show some images
