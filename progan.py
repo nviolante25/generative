@@ -274,12 +274,12 @@ class Trainer():
         z_dim, 
         img_resolution, 
         img_channels, 
-        batch_size, 
         r1_gamma,
         save_loss_every_kimg = 1,
         save_grid_every_kimg = 400,
         kimg_per_phase = 800,
         drift_weight=0.001,
+        resume_network=None,
     ):
         super().__init__()
         self.G = Generator(z_dim, img_resolution, img_channels).to("cuda")
@@ -288,10 +288,13 @@ class Trainer():
         self.G_opt = AdamW(self.G.parameters(), lr=0.002, betas=(0, 0.99), eps=1e-8)
         self.D_opt = AdamW(self.D.parameters(), lr=0.002, betas=(0, 0.99), eps=1e-8)
 
+        # EMA of the generator
+        self.G_ema = deepcopy(self.G).to("cuda")
+        for param in self.G_ema.parameters():
+            param.detach_()
+
         self.z_dim = z_dim
         self.img_resolution = img_resolution
-        self.batch_size = batch_size
-
         
         self.dataset = dataset
 
@@ -304,6 +307,8 @@ class Trainer():
         self.kimg_per_phase = kimg_per_phase
         self.grid_size = 8
         self.grid_z = self.G.sample_z(self.grid_size * self.grid_size).to("cuda")
+
+        self.resume_network = resume_network
 
 
     def train_step(self, real_images, alpha, output_res):
@@ -374,7 +379,7 @@ class Trainer():
         dataloader = cycle(DataLoader(dataset, batch_size=batch_size, drop_last=True, num_workers=16))
 
         total_images = int(self.kimg_per_phase* (2 * self.G.num_blocks - 1) * 1e3)
-        with tqdm(initial=0, total=total_images, position=0, desc="trainig") as pbar:
+        with tqdm(initial=0, total=total_images, position=0, desc="training") as pbar:
             while cur_nimg < total_images:
                 cur_res = phase_resolutions[cur_phase_tick]
                 if cur_phase == "stable":
@@ -384,6 +389,8 @@ class Trainer():
                     
                 real_images = next(dataloader).to("cuda")
                 losses = trainer.train_step(real_images, alpha, cur_res)
+
+                self.update_ema()
 
                 if (cur_nimg % (self.save_loss_every_kimg * 1e3)) < batch_size:
                     self.report(losses, cur_res, cur_nimg)
@@ -402,11 +409,11 @@ class Trainer():
                         batch_size = res_to_batch_size[cur_res]
                         dataloader = cycle(DataLoader(dataset, batch_size=batch_size, drop_last=True, num_workers=16))
 
-                cur_nimg += self.batch_size
-                pbar.update(self.batch_size)
-                phase_bar.update(self.batch_size)
+                cur_nimg += batch_size
+                pbar.update(batch_size)
+                phase_bar.update(batch_size)
 
-        torch.save({"G": self.G.state_dict()}, os.path.join(self.outdir, f"progan_cats_{cur_res}x{cur_res}_final.pt"))
+        torch.save({"G_ema": self.G.state_dict()}, os.path.join(self.outdir, f"progan_cats_{cur_res}x{cur_res}_final.pt"))
 
     def report(self, losses, cur_res, cur_nimg):
         for name, value in losses.items():
@@ -416,22 +423,37 @@ class Trainer():
     @torch.no_grad()
     def save_snapshot(self, cur_nimg, alpha, cur_res):
         grid_z = rearrange(self.grid_z, "(b1 b2) z -> b1 b2 z", b2=1)
-        grid_img = torch.cat([self.G(z, alpha, cur_res) for z in grid_z])
+        grid_img = torch.cat([self.G_ema(z, alpha, cur_res) for z in grid_z])
         grid_img = rearrange(grid_img, "(b1 b2) c h w -> c (b1 h) (b2 w)", b1=self.grid_size, b2=self.grid_size)
         filename = os.path.join(self.outdir, f"fakes_{str(cur_nimg // 1000).zfill(8)}kimg.png")
         to_pil_image(grid_img.clip(-1, 1) * 0.5 + 0.5).save(filename)
         checkpoint = {
+            "G_ema": self.G_ema.state_dict(),
             "G": self.G.state_dict(),
             "G_opt": self.G_opt.state_dict(),
             "D": self.D.state_dict(),
             "D_opt": self.D_opt.state_dict(),
+            "cur_nimg": cur_nimg,
+            "cur_res": cur_res,
+            "alpha": alpha,
         }
         torch.save(checkpoint, os.path.join(self.outdir, f"network-{str(cur_nimg // 1000).zfill(8)}kimg.pt"))
 
-def update_ema(G_ema, G, weight=0.999):
-    for (name_ema, param_ema), (name, param) in zip(G_ema.named_parameters(), G.named_parameters()):
-        assert name_ema == name
-        param_ema.copy_(weight * param + (1 - weight) * param_ema)
+    def resume_from(self, filename):
+        checkpoint = torch.load(filename)
+        self.G_ema.load_state_dict(checkpoint["G_ema"])
+        self.G.load_state_dict(checkpoint["G"])
+        self.D.load_state_dict(checkpoint["D"])
+        self.G_opt.load_state_dict(checkpoint["G_opt"])
+        self.D_opt.load_state_dict(checkpoint["D_opt"])
+
+    def update_ema(self, weight=0.999):
+        for (name_ema, buffer_ema), (name, buffer) in zip(self.G_ema.named_parameters(), self.G.named_parameters()):
+            assert name_ema == name
+            buffer_ema.copy_(weight * buffer + (1 - weight) * buffer_ema)
+        for (name_ema, buffer_ema), (name, buffer) in zip(self.G_ema.named_buffers(), self.G.named_buffers()):
+            assert name_ema == name
+            buffer_ema.copy_(weight * buffer + (1 - weight) * buffer_ema)
 
 def cycle(dataloader):
     while True:
@@ -485,13 +507,12 @@ class ImageDataset(Dataset):
 if __name__ == "__main__":
     dataset = ImageDataset("/data/nviolant/data_eg3d/afhq-mirror-256x256")
     trainer = Trainer(
-        "/data/nviolant/training-runs-progan/progan-cats-256x256-gamma10",
+        "/data/nviolant/training-runs-progan/progan-afhq-256x256-gamma1",
         dataset,
         z_dim=512, 
         img_resolution=256,
         img_channels=3,
-        batch_size=128,
-        r1_gamma=10.0,
+        r1_gamma=1.0,
         drift_weight=0.001,
         save_loss_every_kimg=5,
         save_grid_every_kimg=200,
